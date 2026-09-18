@@ -87,6 +87,11 @@ class PI0Pytorch(nn.Module):
         self.config = config
         self.pi05 = config.pi05
 
+        # 视觉特征 adapter v1
+        # Attach only AFTER loading the official checkpoint.
+        self.feature_adapter = None
+        # 视觉特征 adapter v1
+
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
@@ -148,7 +153,11 @@ class PI0Pytorch(nn.Module):
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
-        if self.gradient_checkpointing_enabled and self.training:
+        # 视觉特征 adapter v1
+        # if self.gradient_checkpointing_enabled and self.training:
+        # 视觉特征 adapter v1
+        if self.gradient_checkpointing_enabled and self.training and torch.is_grad_enabled():
+        # 视觉特征 adapter v1
             return torch.utils.checkpoint.checkpoint(
                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
             )
@@ -195,12 +204,20 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        # 视觉特征 adapter v1
+        # for img, img_mask in zip(images, img_masks, strict=True):
+        for view_index, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
+        # 视觉特征 adapter v1
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+
+            # 视觉特征 adapter v1
+            if self.feature_adapter is not None:
+                img_emb = self.feature_adapter(img_emb, img_mask, view_index)
+            # 视觉特征 adapter v1
 
             bsize, num_img_embs = img_emb.shape[:2]
 
@@ -314,9 +331,17 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+    # 视觉特征 adapter v1
+    # def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    #     """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    #     images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+    # 视觉特征 adapter v1
+    def flow_velocity(self, observation, actions, noise=None, time=None, *, preprocess_train=True):
+        """Return predicted and target FM velocities using shared noise/time."""
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=preprocess_train
+        )
+    # 视觉特征 adapter v1
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -371,7 +396,24 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
+        # 视觉特征 adapter v1
+        # return F.mse_loss(u_t, v_t, reduction="none")
+        # 视觉特征 adapter v1
+        return v_t, u_t
+        # 视觉特征 adapter v1
+
+    # 视觉特征 adapter v1
+    def forward(self, observation, actions, noise=None, time=None, *, preprocess_train=True) -> Tensor:
+        """Return unreduced FM loss with the original OpenPI behavior."""
+        v_t, u_t = self.flow_velocity(
+            observation,
+            actions,
+            noise=noise,
+            time=time,
+            preprocess_train=preprocess_train,
+        )
         return F.mse_loss(u_t, v_t, reduction="none")
+    # 视觉特征 adapter v1
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

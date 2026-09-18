@@ -41,6 +41,11 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # 解决响应 timeout
+            ping_interval=20,
+            ping_timeout=300,
+            close_timeout=30,
+            # 解决响应 timeout
             process_request=_health_check,
         ) as server:
             await server.serve_forever()
@@ -58,7 +63,15 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+
+                # 解决响应 timeout
+                # action = self._policy.infer(obs)
+                action = await asyncio.to_thread(
+                    self._policy.infer,
+                    obs,
+                )
+                # 解决响应 timeout
+
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

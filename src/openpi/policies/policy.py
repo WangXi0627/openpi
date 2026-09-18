@@ -18,6 +18,8 @@ from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
+_FLOW_NOISE_SEED_KEY = "__openpi_flow_noise_seed"   # 去除 baseline 与配置采样随机性
+
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
@@ -65,7 +67,54 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    # 去除 baseline 与配置采样随机性
+    # def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    # 去除 baseline 与配置采样随机性
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+        # WebSocket 请求中可以携带一个只用于控制 flow-matching 初始噪声的 seed。
+        # 必须在 input transform 前删除，避免模型把它当成 observation 字段。
+        obs = dict(obs)
+        flow_noise_seed = obs.pop(
+            _FLOW_NOISE_SEED_KEY,
+            None,
+        )
+        if flow_noise_seed is not None:
+            if noise is not None:
+                raise ValueError(
+                    "Cannot provide both explicit noise and "
+                    "__openpi_flow_noise_seed"
+                )
+            if not self._is_pytorch_model:
+                raise ValueError(
+                    "__openpi_flow_noise_seed currently supports "
+                    "PyTorch OpenPI policies only"
+                )
+            if not isinstance(
+                flow_noise_seed,
+                (int, np.integer),
+            ):
+                raise TypeError(
+                    "__openpi_flow_noise_seed must be an integer, "
+                    f"got {type(flow_noise_seed).__name__}"
+                )
+            flow_noise_seed = int(flow_noise_seed)
+            if flow_noise_seed < 0:
+                raise ValueError(
+                    "__openpi_flow_noise_seed must be non-negative"
+                )
+            # 在 CPU 上用独立 NumPy RNG 生成噪声。
+            # 它不会改变 PyTorch、CUDA 或服务器全局 RNG 状态。
+            noise_rng = np.random.default_rng(
+                flow_noise_seed
+            )
+            noise = noise_rng.standard_normal(
+                (
+                    self._model.config.action_horizon,
+                    self._model.config.action_dim,
+                )
+            ).astype(np.float32)
+        # 去除 baseline 与配置采样随机性
+        
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)

@@ -35,7 +35,13 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    # 解决响应 timeout
+                    self._uri, compression=None, max_size=None, 
+                    ping_interval=20,
+                    ping_timeout=300,
+                    close_timeout=30,
+                    additional_headers=headers
+                    # 解决响应 timeout
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
