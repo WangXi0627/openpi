@@ -76,15 +76,113 @@ class VisualFeatureAdapter(nn.Module):
         self._records.clear()
         self._capture = False
 
-    def forward(self, features, image_mask, view_index: int):
+    # DRR@2048 + correlation evaluation
+    # def forward(self, features, image_mask, view_index: int):
+    #     if view_index not in self.spec.view_indices:
+    #         return features
+    #     z = self.encode(features)
+    #     with torch.autocast(device_type=features.device.type, enabled=False):
+    #         residual = self.spec.residual_scale * self.up(z)
+    #         valid = image_mask.to(device=features.device, dtype=torch.bool)
+    #         residual = residual * valid[:, None, None]
+    #         result = (features.float() + residual).to(features.dtype)
+    #     if self._capture:
+    #         self._records.append({"view": view_index, "z": z, "valid": valid})
+    #     return result
+    # DRR@2048 + correlation evaluation
+    def _adapt_impl(
+        self,
+        features,
+        image_mask,
+    ):
+        """
+        Apply the residual adapter without any capture side effects.
+
+        Returns:
+            z:
+                Bottleneck feature [B, T, rank].
+            result:
+                Adapted visual feature [B, T, D].
+            valid:
+                Per-image validity mask [B].
+        """
+        z = self.encode(features)
+
+        with torch.autocast(
+            device_type=features.device.type,
+            enabled=False,
+        ):
+            residual = (
+                self.spec.residual_scale
+                * self.up(z)
+            )
+
+            valid = image_mask.to(
+                device=features.device,
+                dtype=torch.bool,
+            )
+
+            residual = (
+                residual
+                * valid[:, None, None]
+            )
+
+            result = (
+                features.float()
+                + residual
+            ).to(features.dtype)
+
+        return z, result, valid
+
+    def adapt(
+        self,
+        features,
+        image_mask,
+    ):
+        """
+        Apply the adapter without writing capture records.
+
+        This is used by the augmented DRR branch so that the second
+        representation participates in gradient computation without
+        polluting the main forward capture buffer.
+        """
+        _, result, _ = self._adapt_impl(
+            features,
+            image_mask,
+        )
+
+        return result
+
+    def forward(
+        self,
+        features,
+        image_mask,
+        view_index: int,
+    ):
         if view_index not in self.spec.view_indices:
             return features
-        z = self.encode(features)
-        with torch.autocast(device_type=features.device.type, enabled=False):
-            residual = self.spec.residual_scale * self.up(z)
-            valid = image_mask.to(device=features.device, dtype=torch.bool)
-            residual = residual * valid[:, None, None]
-            result = (features.float() + residual).to(features.dtype)
+
+        z, result, valid = self._adapt_impl(
+            features,
+            image_mask,
+        )
+
         if self._capture:
-            self._records.append({"view": view_index, "z": z, "valid": valid})
+            self._records.append(
+                {
+                    "view": view_index,
+
+                    # Legacy v1 representation target.
+                    "z": z,
+
+                    # New DRR representation target.
+                    # Keep graph: DRR must backpropagate through h'.
+                    "output": result,
+
+                    "valid": valid,
+                }
+            )
+
         return result
+    # DRR@2048 + correlation evaluation
+    

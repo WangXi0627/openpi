@@ -8,3 +8,6 @@ openpi/src/openpi/models_pytorch/pi0_pytorch.py: **修改**添加 adapter 接入
 
 ## 去除 baseline 与配置采样随机性
 openpi/src/openpi/policies/policy.py: **修改**
+
+## DRR@2048 + correlation evaluation
+openpi/src/openpi/models_pytorch/feature_adapter.py: **修改**
