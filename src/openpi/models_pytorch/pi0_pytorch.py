@@ -194,7 +194,17 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        *,
+        adapter_mask_logits=None,
+        adapter_mask_gates=None,
+        adapter_mask_beta: float = 1.0,
+        adapter_mask_hard: bool = False,
+        adapter_enabled: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -215,8 +225,16 @@ class PI0Pytorch(nn.Module):
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
             # 视觉特征 adapter v1
-            if self.feature_adapter is not None:
-                img_emb = self.feature_adapter(img_emb, img_mask, view_index)
+            if self.feature_adapter is not None and adapter_enabled:
+                img_emb = self.feature_adapter(
+                    img_emb,
+                    img_mask,
+                    view_index,
+                    mask_logits=adapter_mask_logits,
+                    mask_gates=adapter_mask_gates,
+                    mask_beta=adapter_mask_beta,
+                    mask_hard=adapter_mask_hard,
+                )
             # 视觉特征 adapter v1
 
             bsize, num_img_embs = img_emb.shape[:2]
@@ -336,7 +354,20 @@ class PI0Pytorch(nn.Module):
     #     """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
     #     images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
     # 视觉特征 adapter v1
-    def flow_velocity(self, observation, actions, noise=None, time=None, *, preprocess_train=True):
+    def flow_velocity(
+        self,
+        observation,
+        actions,
+        noise=None,
+        time=None,
+        *,
+        preprocess_train=True,
+        adapter_mask_logits=None,
+        adapter_mask_gates=None,
+        adapter_mask_beta: float = 1.0,
+        adapter_mask_hard: bool = False,
+        adapter_enabled: bool = True,
+    ):
         """Return predicted and target FM velocities using shared noise/time."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
             observation, train=preprocess_train
@@ -353,7 +384,17 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            adapter_mask_logits=adapter_mask_logits,
+            adapter_mask_gates=adapter_mask_gates,
+            adapter_mask_beta=adapter_mask_beta,
+            adapter_mask_hard=adapter_mask_hard,
+            adapter_enabled=adapter_enabled,
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -403,7 +444,20 @@ class PI0Pytorch(nn.Module):
         # 视觉特征 adapter v1
 
     # 视觉特征 adapter v1
-    def forward(self, observation, actions, noise=None, time=None, *, preprocess_train=True) -> Tensor:
+    def forward(
+        self,
+        observation,
+        actions,
+        noise=None,
+        time=None,
+        *,
+        preprocess_train=True,
+        adapter_mask_logits=None,
+        adapter_mask_gates=None,
+        adapter_mask_beta: float = 1.0,
+        adapter_mask_hard: bool = False,
+        adapter_enabled: bool = True,
+    ) -> Tensor:
         """Return unreduced FM loss with the original OpenPI behavior."""
         v_t, u_t = self.flow_velocity(
             observation,
@@ -411,12 +465,29 @@ class PI0Pytorch(nn.Module):
             noise=noise,
             time=time,
             preprocess_train=preprocess_train,
+            adapter_mask_logits=adapter_mask_logits,
+            adapter_mask_gates=adapter_mask_gates,
+            adapter_mask_beta=adapter_mask_beta,
+            adapter_mask_hard=adapter_mask_hard,
+            adapter_enabled=adapter_enabled,
         )
         return F.mse_loss(u_t, v_t, reduction="none")
     # 视觉特征 adapter v1
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        *,
+        adapter_mask_logits=None,
+        adapter_mask_gates=None,
+        adapter_mask_beta: float = 1.0,
+        adapter_mask_hard: bool = False,
+        adapter_enabled: bool = True,
+    ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -425,7 +496,17 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            adapter_mask_logits=adapter_mask_logits,
+            adapter_mask_gates=adapter_mask_gates,
+            adapter_mask_beta=adapter_mask_beta,
+            adapter_mask_hard=adapter_mask_hard,
+            adapter_enabled=adapter_enabled,
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 

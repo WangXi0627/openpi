@@ -9,6 +9,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from openpi.models_pytorch.feature_mask import FeatureMaskSpec
+from openpi.models_pytorch.feature_mask import apply_grouped_feature_mask
+
 
 @dataclass(frozen=True)
 class FeatureAdapterSpec:
@@ -47,9 +50,16 @@ class VisualFeatureAdapter(nn.Module):
     checkpoints remain loadable without adapter keys.
     """
 
-    def __init__(self, spec: FeatureAdapterSpec):
+    def __init__(
+        self,
+        spec: FeatureAdapterSpec,
+        mask_spec: FeatureMaskSpec | None = None,
+    ):
         super().__init__()
         self.spec = spec
+        if mask_spec is not None and mask_spec.feature_dim != spec.feature_dim:
+            raise ValueError("Adapter and mask feature dimensions must match")
+        self.mask_spec = mask_spec
         self.norm = nn.LayerNorm(spec.feature_dim)
         self.down = nn.Linear(spec.feature_dim, spec.rank, bias=False)
         self.up = nn.Linear(spec.rank, spec.feature_dim, bias=False)
@@ -153,31 +163,87 @@ class VisualFeatureAdapter(nn.Module):
 
         return result
 
+    def apply_mask(
+        self,
+        features,
+        *,
+        mask_logits=None,
+        mask_gates=None,
+        mask_beta: float = 1.0,
+        mask_hard: bool = False,
+    ):
+        """Apply the post-adapter grouped channel mask.
+
+        This method is intentionally functional: task-specific mask values are
+        passed by the caller instead of being stored as mutable module state.
+        """
+
+        if mask_logits is None and mask_gates is None:
+            return features, None
+        if self.mask_spec is None:
+            raise RuntimeError("A FeatureMaskSpec is required when a mask is supplied")
+        return apply_grouped_feature_mask(
+            features,
+            spec=self.mask_spec,
+            group_logits=mask_logits,
+            group_gates=mask_gates,
+            beta=mask_beta,
+            hard=mask_hard,
+        )
+
     def forward(
         self,
         features,
         image_mask,
         view_index: int,
+        *,
+        mask_logits=None,
+        mask_gates=None,
+        mask_beta: float = 1.0,
+        mask_hard: bool = False,
     ):
         if view_index not in self.spec.view_indices:
             return features
 
-        z, result, valid = self._adapt_impl(
+        z, pre_mask, valid = self._adapt_impl(
             features,
             image_mask,
         )
+
+        post_mask, resolved_gates = self.apply_mask(
+            pre_mask,
+            mask_logits=mask_logits,
+            mask_gates=mask_gates,
+            mask_beta=mask_beta,
+            mask_hard=mask_hard,
+        )
+
+        # Invalid/padded image slots must remain exactly unchanged.
+        valid_view = valid[:, None, None]
+        result = torch.where(valid_view, post_mask, features)
 
         if self._capture:
             self._records.append(
                 {
                     "view": view_index,
 
+                    # Frozen SigLIP representation before the adapter.
+                    "input": features,
+
                     # Legacy v1 representation target.
                     "z": z,
 
-                    # New DRR representation target.
-                    # Keep graph: DRR must backpropagate through h'.
-                    "output": result,
+                    # DRR target. Keep graph: DRR must update the adapter, but
+                    # it must not optimize the post-mask representation.
+                    "pre_mask": pre_mask,
+
+                    # Final representation consumed by PaliGemma.
+                    "post_mask": result,
+
+                    # Backward-compatible alias for adapter-v1 tooling.
+                    "output": pre_mask,
+
+                    "group_gates": resolved_gates,
 
                     "valid": valid,
                 }

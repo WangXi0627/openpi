@@ -19,6 +19,7 @@ from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
 _FLOW_NOISE_SEED_KEY = "__openpi_flow_noise_seed"   # 去除 baseline 与配置采样随机性
+_ADAPTER_BASE_TASK_ID_KEY = "__openpi_adapter_base_task_id"
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -56,6 +57,7 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._adapter_mask_bank: dict[str, torch.Tensor] = {}
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -65,6 +67,31 @@ class Policy(BasePolicy):
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+
+    def install_adapter_mask_bank(self, mask_bank: dict[str, torch.Tensor]) -> None:
+        """Install immutable per-base-task inference gates.
+
+        The selected tensor is passed as an argument for every request. No
+        process-global "active mask" is mutated, so concurrent requests for
+        different tasks cannot overwrite one another.
+        """
+
+        if not self._is_pytorch_model:
+            raise ValueError("Feature-mask inference supports PyTorch policies only")
+        validated: dict[str, torch.Tensor] = {}
+        for key, value in mask_bank.items():
+            task_id = str(key).strip()
+            if not task_id:
+                raise ValueError("Mask-bank task IDs must be non-empty strings")
+            gates = torch.as_tensor(value, dtype=torch.float32, device=self._pytorch_device)
+            if gates.ndim != 1 or not torch.isfinite(gates).all():
+                raise ValueError(f"Invalid gate tensor for base task {task_id!r}")
+            if bool(((gates < 0) | (gates > 1)).any()):
+                raise ValueError(f"Gates for base task {task_id!r} must lie in [0, 1]")
+            validated[task_id] = gates.detach().clone()
+        if not validated:
+            raise ValueError("Mask bank cannot be empty")
+        self._adapter_mask_bank = validated
 
     @override
     # 去除 baseline 与配置采样随机性
@@ -78,6 +105,7 @@ class Policy(BasePolicy):
             _FLOW_NOISE_SEED_KEY,
             None,
         )
+        adapter_base_task_id = obs.pop(_ADAPTER_BASE_TASK_ID_KEY, None)
         if flow_noise_seed is not None:
             if noise is not None:
                 raise ValueError(
@@ -129,6 +157,21 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        if self._adapter_mask_bank:
+            if adapter_base_task_id is None:
+                raise ValueError(
+                    "This policy requires __openpi_adapter_base_task_id for mask selection"
+                )
+            task_key = str(adapter_base_task_id)
+            if task_key not in self._adapter_mask_bank:
+                raise KeyError(
+                    f"Unknown adapter base task {task_key!r}; "
+                    f"available={sorted(self._adapter_mask_bank)}"
+                )
+            sample_kwargs["adapter_mask_gates"] = self._adapter_mask_bank[task_key]
+        # A vanilla server deliberately ignores the optional task ID. This
+        # allows paired vanilla/meta-adapter evaluation to use the same client
+        # request format while a meta-adapter server still requires the ID.
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
