@@ -20,3 +20,6 @@ openpi/src/openpi/policies/policy.py: **修改**每个请求显式选择 mask
 
 openpi/src/openpi/models_pytorch/feature_mask.py: **新增**实现 grouped channel mask
 openpi/src/openpi/models_pytorch/feature_mask_test.py: **新增**
+
+# Outcome Head
+openpi/src/openpi/models_pytorch/pi0_pytorch.py: **修改**

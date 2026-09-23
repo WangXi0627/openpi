@@ -542,6 +542,127 @@ class PI0Pytorch(nn.Module):
             time += dt
         return x_t
 
+    @torch.no_grad()
+    def sample_actions_with_features(
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        *,
+        feature_horizon=5,
+        adapter_mask_logits=None,
+        adapter_mask_gates=None,
+        adapter_mask_beta: float = 1.0,
+        adapter_mask_hard: bool = False,
+        adapter_enabled: bool = True,
+    ) -> dict[str, Tensor]:
+        """Sample actions and expose noise-dependent and state-only features.
+
+        This is intentionally separate from ``sample_actions`` so the existing
+        compiled/default inference API and return type remain unchanged.
+
+        Returns:
+            actions: Final normalized action chunk [B, H, A].
+            pre_velocity: Expert hidden states before action_out_proj,
+                [B, denoise_steps, feature_horizon, D].
+            context: Masked-mean prefix hidden state computed before action
+                noise is introduced, [B, C].
+        """
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        if feature_horizon <= 0 or feature_horizon > self.config.action_horizon:
+            raise ValueError(
+                "feature_horizon must lie in [1, action_horizon], "
+                f"got {feature_horizon}"
+            )
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+        if tuple(noise.shape) != (
+            bsize,
+            self.config.action_horizon,
+            self.config.action_dim,
+        ):
+            raise ValueError(
+                "noise shape mismatch: "
+                f"got {tuple(noise.shape)}, expected "
+                f"{(bsize, self.config.action_horizon, self.config.action_dim)}"
+            )
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            adapter_mask_logits=adapter_mask_logits,
+            adapter_mask_gates=adapter_mask_gates,
+            adapter_mask_beta=adapter_mask_beta,
+            adapter_mask_hard=adapter_mask_hard,
+            adapter_enabled=adapter_enabled,
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        (prefix_hidden, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        context_mask = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
+        context = (
+            (prefix_hidden.to(dtype=torch.float32) * context_mask).sum(dim=1)
+            / context_mask.sum(dim=1).clamp_min(1.0)
+        )
+
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        pre_velocity_steps = []
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+            velocity, pre_velocity = self.denoise_step_with_features(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+            )
+            pre_velocity_steps.append(pre_velocity[:, :feature_horizon])
+            x_t = x_t + dt * velocity
+            time += dt
+        return {
+            "actions": x_t,
+            "pre_velocity": torch.stack(pre_velocity_steps, dim=1),
+            "context": context,
+        }
+
+    def denoise_step_with_features(
+        self,
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        timestep,
+    ) -> tuple[Tensor, Tensor]:
+        """Compatibility wrapper returning velocity and pre-projection state."""
+        return self.denoise_step(
+            state,
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            timestep,
+            return_pre_velocity=True,
+        )
+
     def denoise_step(
         self,
         state,
@@ -549,8 +670,10 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        *,
+        return_pre_velocity: bool = False,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step, optionally exposing pre-projection state."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -579,7 +702,10 @@ class PI0Pytorch(nn.Module):
             adarms_cond=[None, adarms_cond],
         )
 
-        suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        pre_velocity = outputs_embeds[1]
+        pre_velocity = pre_velocity[:, -self.config.action_horizon :]
+        pre_velocity = pre_velocity.to(dtype=torch.float32)
+        velocity = self.action_out_proj(pre_velocity)
+        if return_pre_velocity:
+            return velocity, pre_velocity
+        return velocity
