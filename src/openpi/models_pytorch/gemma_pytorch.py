@@ -1,5 +1,7 @@
 from typing import Literal
 
+from openpi.models_pytorch.feature_intervention import apply_mid_vlm_intervention
+
 import torch
 from torch import nn
 from transformers import GemmaForCausalLM
@@ -87,6 +89,42 @@ class PaliGemmaWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
+    def _prefill_with_intervention(
+        self, inputs_embeds, attention_mask, position_ids, past_key_values,
+        use_cache, adarms_cond, feature_intervention, intervention_context, feature_observer,
+    ):
+        """Mirror the pinned patched Gemma prefix path without mutable layer hooks."""
+        model = self.paligemma.language_model
+        use_cache = model.config.use_cache if use_cache is None else use_cache
+        if model.gradient_checkpointing and model.training and use_cache:
+            raise ValueError("Meta-subspace prefill requires eval mode when using KV cache")
+        if use_cache and past_key_values is None:
+            past_key_values = modeling_gemma.DynamicCache()
+        seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(seen, seen + inputs_embeds.shape[1], device=inputs_embeds.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+        causal_mask = modeling_gemma.create_causal_mask(
+            config=model.config, input_embeds=inputs_embeds, attention_mask=attention_mask,
+            cache_position=cache_position, past_key_values=past_key_values, position_ids=position_ids,
+        )
+        hidden = inputs_embeds
+        if model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            hidden = hidden.to(torch.bfloat16)
+        position_embeddings = model.rotary_emb(hidden, position_ids)
+        for layer_index, layer in enumerate(model.layers[:model.config.num_hidden_layers]):
+            hidden = apply_mid_vlm_intervention(
+                hidden, layer_index, intervention=feature_intervention,
+                context=intervention_context, observer=feature_observer,
+            )
+            hidden = layer(
+                hidden, attention_mask=causal_mask, position_ids=position_ids,
+                past_key_value=past_key_values, output_attentions=False, use_cache=use_cache,
+                cache_position=cache_position, position_embeddings=position_embeddings, adarms_cond=adarms_cond,
+            )[0]
+        hidden, _ = model.norm(hidden, adarms_cond)
+        return hidden, past_key_values if use_cache else None
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -95,10 +133,22 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        feature_intervention: nn.Module | None = None,
+        intervention_context: dict | None = None,
+        feature_observer=None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
-        if inputs_embeds[1] is None:
+        if inputs_embeds[1] is None and (
+            feature_observer is not None
+            or (feature_intervention is not None and (intervention_context or {}).get("task_code") is not None)
+        ):
+            prefix_output, prefix_past_key_values = self._prefill_with_intervention(
+                inputs_embeds[0], attention_mask, position_ids, past_key_values,
+                use_cache, adarms_cond[0], feature_intervention, intervention_context, feature_observer,
+            )
+            suffix_output = None
+        elif inputs_embeds[1] is None:
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
@@ -238,6 +288,13 @@ class PaliGemmaWithExpertModel(nn.Module):
 
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
+                inputs_embeds = [
+                    apply_mid_vlm_intervention(
+                        inputs_embeds[0], layer_idx, intervention=feature_intervention,
+                        context=intervention_context, observer=feature_observer,
+                    ),
+                    inputs_embeds[1],
+                ]
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,

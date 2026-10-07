@@ -20,6 +20,8 @@ from openpi.shared import nnx_utils
 
 _FLOW_NOISE_SEED_KEY = "__openpi_flow_noise_seed"   # 去除 baseline 与配置采样随机性
 _ADAPTER_BASE_TASK_ID_KEY = "__openpi_adapter_base_task_id"
+_META_CATEGORY_KEY = "__openpi_perturbation_category"
+_META_VARIANT_KEY = "__openpi_variant_id"
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -58,6 +60,7 @@ class Policy(BasePolicy):
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
         self._adapter_mask_bank: dict[str, torch.Tensor] = {}
+        self._meta_subspace_provider = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -93,6 +96,14 @@ class Policy(BasePolicy):
             raise ValueError("Mask bank cannot be empty")
         self._adapter_mask_bank = validated
 
+    def install_meta_subspace_provider(self, provider) -> None:
+        """Install a support bank; task codes remain explicit per infer call."""
+        if not self._is_pytorch_model or not callable(provider):
+            raise ValueError("Meta-subspace provider requires a PyTorch policy and callable")
+        if self._adapter_mask_bank:
+            raise ValueError("Do not combine old adapter mask banks with meta-subspace v1")
+        self._meta_subspace_provider = provider
+
     @override
     # 去除 baseline 与配置采样随机性
     # def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -106,6 +117,8 @@ class Policy(BasePolicy):
             None,
         )
         adapter_base_task_id = obs.pop(_ADAPTER_BASE_TASK_ID_KEY, None)
+        meta_category = obs.pop(_META_CATEGORY_KEY, None)
+        meta_variant = obs.pop(_META_VARIANT_KEY, None)
         if flow_noise_seed is not None:
             if noise is not None:
                 raise ValueError(
@@ -157,6 +170,12 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        meta_details = None
+        if self._meta_subspace_provider is not None:
+            task_code, meta_details = self._meta_subspace_provider(
+                base_task_id=adapter_base_task_id, category=meta_category, variant_id=meta_variant,
+            )
+            sample_kwargs["intervention_task_code"] = task_code
         if self._adapter_mask_bank:
             if adapter_base_task_id is None:
                 raise ValueError(
@@ -192,6 +211,8 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if meta_details is not None:
+            outputs["meta_subspace"] = meta_details
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

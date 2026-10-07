@@ -90,6 +90,7 @@ class PI0Pytorch(nn.Module):
         # 视觉特征 adapter v1
         # Attach only AFTER loading the official checkpoint.
         self.feature_adapter = None
+        self.feature_intervention = None
         # 视觉特征 adapter v1
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -128,6 +129,12 @@ class PI0Pytorch(nn.Module):
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+    def set_feature_intervention(self, intervention):
+        """Attach after official checkpoint loading; no per-request state is stored."""
+        if intervention is not None and not isinstance(intervention, nn.Module):
+            raise TypeError("feature intervention must be an nn.Module or None")
+        self.feature_intervention = intervention
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -205,12 +212,14 @@ class PI0Pytorch(nn.Module):
         adapter_mask_beta: float = 1.0,
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
+        return_image_token_mask: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
         embs = []
         pad_masks = []
+        image_masks = []
         att_masks = []
 
         # Process images
@@ -241,6 +250,7 @@ class PI0Pytorch(nn.Module):
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            image_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
@@ -255,6 +265,7 @@ class PI0Pytorch(nn.Module):
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
+        image_masks.append(torch.zeros_like(lang_masks, dtype=torch.bool))
 
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
@@ -268,6 +279,8 @@ class PI0Pytorch(nn.Module):
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
+        if return_image_token_mask:
+            return embs, pad_masks, att_masks, torch.cat(image_masks, dim=1).bool()
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -367,6 +380,8 @@ class PI0Pytorch(nn.Module):
         adapter_mask_beta: float = 1.0,
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
+        intervention_task_code=None,
+        intervention_enabled: bool = True,
     ):
         """Return predicted and target FM velocities using shared noise/time."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
@@ -384,7 +399,7 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, image_token_mask = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -394,6 +409,7 @@ class PI0Pytorch(nn.Module):
             adapter_mask_beta=adapter_mask_beta,
             adapter_mask_hard=adapter_mask_hard,
             adapter_enabled=adapter_enabled,
+            return_image_token_mask=True,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
@@ -421,6 +437,8 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                feature_intervention=self.feature_intervention if intervention_enabled else None,
+                intervention_context={"image_token_mask": image_token_mask, "task_code": intervention_task_code},
             )
             return suffix_out
 
@@ -457,6 +475,8 @@ class PI0Pytorch(nn.Module):
         adapter_mask_beta: float = 1.0,
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
+        intervention_task_code=None,
+        intervention_enabled: bool = True,
     ) -> Tensor:
         """Return unreduced FM loss with the original OpenPI behavior."""
         v_t, u_t = self.flow_velocity(
@@ -470,6 +490,8 @@ class PI0Pytorch(nn.Module):
             adapter_mask_beta=adapter_mask_beta,
             adapter_mask_hard=adapter_mask_hard,
             adapter_enabled=adapter_enabled,
+            intervention_task_code=intervention_task_code,
+            intervention_enabled=intervention_enabled,
         )
         return F.mse_loss(u_t, v_t, reduction="none")
     # 视觉特征 adapter v1
@@ -487,6 +509,8 @@ class PI0Pytorch(nn.Module):
         adapter_mask_beta: float = 1.0,
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
+        intervention_task_code=None,
+        intervention_enabled: bool = True,
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -496,7 +520,7 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, image_token_mask = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -506,6 +530,7 @@ class PI0Pytorch(nn.Module):
             adapter_mask_beta=adapter_mask_beta,
             adapter_mask_hard=adapter_mask_hard,
             adapter_enabled=adapter_enabled,
+            return_image_token_mask=True,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -519,6 +544,8 @@ class PI0Pytorch(nn.Module):
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
+            feature_intervention=self.feature_intervention if intervention_enabled else None,
+            intervention_context={"image_token_mask": image_token_mask, "task_code": intervention_task_code},
             use_cache=True,
         )
 
@@ -556,6 +583,8 @@ class PI0Pytorch(nn.Module):
         adapter_mask_beta: float = 1.0,
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
+        intervention_task_code=None,
+        intervention_enabled: bool = True,
     ) -> dict[str, Tensor]:
         """Sample actions and expose noise-dependent and state-only features.
 
@@ -594,7 +623,7 @@ class PI0Pytorch(nn.Module):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
             observation, train=False
         )
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, image_token_mask = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -604,6 +633,7 @@ class PI0Pytorch(nn.Module):
             adapter_mask_beta=adapter_mask_beta,
             adapter_mask_hard=adapter_mask_hard,
             adapter_enabled=adapter_enabled,
+            return_image_token_mask=True,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -615,6 +645,8 @@ class PI0Pytorch(nn.Module):
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
+            feature_intervention=self.feature_intervention if intervention_enabled else None,
+            intervention_context={"image_token_mask": image_token_mask, "task_code": intervention_task_code},
             use_cache=True,
         )
         context_mask = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
@@ -644,6 +676,34 @@ class PI0Pytorch(nn.Module):
             "pre_velocity": torch.stack(pre_velocity_steps, dim=1),
             "context": context,
         }
+
+    @torch.no_grad()
+    def extract_prefix_features(self, observation, *, sites=("pre_joint_layer_12",)):
+        """Pool valid image tokens BEFORE intervention; no action noise is needed."""
+        from openpi.models_pytorch.feature_intervention import MID_VLM_SITES
+        if not set(sites).issubset(set(MID_VLM_SITES.values())) or not sites:
+            raise ValueError("Unknown or empty mid-VLM feature sites")
+        images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
+        prefix, pads, att, image_mask = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks,
+            adapter_enabled=False, return_image_token_mask=True,
+        )
+        captured = {}
+        def observe(hidden, *, site, context):
+            if site in sites:
+                weights = context["image_token_mask"][..., None].float()
+                if bool((weights.sum(dim=1) == 0).any()):
+                    raise ValueError("No valid image tokens")
+                captured[site] = ((hidden.float() * weights).sum(dim=1) / weights.sum(dim=1)).detach()
+        self.paligemma_with_expert.forward(
+            inputs_embeds=[prefix, None],
+            attention_mask=self._prepare_attention_masks_4d(make_att_2d_masks(pads, att)),
+            position_ids=torch.cumsum(pads, dim=1) - 1, use_cache=False,
+            intervention_context={"image_token_mask": image_mask}, feature_observer=observe,
+        )
+        if set(captured) != set(sites):
+            raise RuntimeError("Requested site was not reached by the loaded VLM")
+        return captured
 
     def denoise_step_with_features(
         self,
