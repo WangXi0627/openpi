@@ -58,7 +58,7 @@ class Shift(nn.Module):
         if site != self.site:
             return hidden
         self.calls += 1
-        return hidden + self.amount * context["task_code"][:, :1, None]
+        return hidden + (self.amount * context["task_code"][:, :1, None]).to(hidden.dtype)
 
 
 @pytest.mark.parametrize("layer", [9, 12, 15])
@@ -186,3 +186,116 @@ def test_actual_embed_prefix_marks_only_valid_camera_tokens():
     assert with_mask[3].sum(1).tolist() == [6, 3]
     assert not with_mask[3][:, -2:].any()
     assert not with_mask[3][:, 6:9].any()
+
+
+def bf16_joint():
+    model = tiny_joint().to(torch.bfloat16)
+    # Match pi0's mixed precision: attention weights BF16, RMSNorm weights FP32.
+    for name, parameter in model.named_parameters():
+        if "norm" in name:
+            parameter.data = parameter.data.float()
+    return model
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+@pytest.mark.parametrize("mask_dtype", [torch.float32, torch.float64, torch.bool])
+def test_bf16_sdpa_prefill_bias_dtype_and_intervention(monkeypatch, use_cache, mask_dtype):
+    model = bf16_joint()
+    model.paligemma.language_model.config._attn_implementation = "sdpa"
+    prefix = torch.randn(1, 4, 32)  # SigLIP can supply FP32 prefix embeddings.
+    allowed = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    allowed[..., -1] = False
+    mask = allowed if mask_dtype == torch.bool else torch.where(allowed, 0.0, -2.3819763e38).to(mask_dtype)
+    reference_mask = mask if mask_dtype == torch.bool else mask.to(torch.bfloat16)
+    baseline = model.paligemma.language_model(
+        inputs_embeds=prefix, attention_mask=reference_mask, position_ids=torch.arange(4)[None], use_cache=use_cache
+    )
+    actual_sdpa = torch.nn.functional.scaled_dot_product_attention
+    calls = []
+
+    def checked_sdpa(query, key, value, *, attn_mask=None, **kwargs):
+        assert attn_mask is None or attn_mask.dtype in (torch.bool, query.dtype)
+        calls.append((query.dtype, attn_mask.dtype))
+        return actual_sdpa(query, key, value, attn_mask=attn_mask, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", checked_sdpa)
+    intervention = Shift("pre_joint_layer_12")
+    args = dict(
+        inputs_embeds=[prefix, None],
+        attention_mask=mask,
+        position_ids=torch.arange(4)[None],
+        use_cache=use_cache,
+        feature_intervention=intervention,
+        intervention_context={
+            "image_token_mask": torch.tensor([[True, True, False, False]]),
+            "task_code": torch.ones(1, 2),
+        },
+    )
+    (identity, _), cache = model.forward(**args)
+    assert len(calls) == 15 and all(query == torch.bfloat16 for query, _ in calls)
+    assert torch.equal(identity, baseline.last_hidden_state)
+    if use_cache:
+        for first, second in zip(cache.key_cache, baseline.past_key_values.key_cache, strict=True):
+            assert torch.equal(first, second)
+    else:
+        assert cache is None
+    intervention.amount.data.fill_(0.2)
+    (adapted, _), changed_cache = model.forward(**args)
+    assert torch.isfinite(adapted).all() and not torch.equal(adapted, identity)
+    if use_cache:
+        assert not torch.equal(changed_cache.key_cache[11], cache.key_cache[11])
+
+
+def test_actual_bf16_extraction_uses_baseline_eager_and_restores_config(monkeypatch):
+    source = Path(__file__).with_name("pi0_pytorch.py")
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "PI0Pytorch")
+    method = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "extract_prefix_features"
+    )
+    scope = {"torch": torch, "make_att_2d_masks": lambda pads, att: pads[:, :, None] & pads[:, None, :]}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), str(source), "exec"), scope)
+    trunk = bf16_joint()
+    config = trunk.paligemma.language_model.config
+    prefix = torch.randn(1, 4, 32)
+    pads = torch.tensor([[True, True, True, False]])
+    image_mask = torch.tensor([[True, True, False, False]])
+    model = SimpleNamespace(
+        paligemma_with_expert=trunk,
+        _preprocess_observation=lambda observation, train: (None, None, None, None, None),
+        embed_prefix=lambda *args, **kwargs: (prefix, pads, torch.zeros_like(pads), image_mask),
+        _prepare_attention_masks_4d=lambda mask: torch.where(mask[:, None], 0.0, -2.3819763e38),
+    )
+    expected = {}
+
+    def observe(hidden, *, site, context):
+        expected[site] = hidden[:, :2].float().mean(dim=1)
+
+    trunk.forward(
+        inputs_embeds=[prefix, None],
+        attention_mask=model._prepare_attention_masks_4d(scope["make_att_2d_masks"](pads, None)),
+        position_ids=pads.cumsum(dim=1) - 1,
+        use_cache=False,
+        feature_observer=observe,
+    )
+    config._attn_implementation = "sdpa"
+
+    def forbidden_sdpa(*args, **kwargs):
+        pytest.fail("Feature extraction must match pi0's eager prefill")
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", forbidden_sdpa)
+    sites = tuple(expected)
+    result = scope["extract_prefix_features"](model, None, sites=sites)
+    assert config._attn_implementation == "sdpa"
+    assert set(result) == set(sites) and len(result) == 3
+    for site in sites:
+        assert result[site].shape == (1, 32) and torch.equal(result[site], expected[site])
+
+    def failing_forward(**kwargs):
+        assert config._attn_implementation == "eager"
+        raise RuntimeError("synthetic extraction failure")
+
+    monkeypatch.setattr(trunk, "forward", failing_forward)
+    with pytest.raises(RuntimeError, match="synthetic extraction failure"):
+        scope["extract_prefix_features"](model, None, sites=sites)
+    assert config._attn_implementation == "sdpa"

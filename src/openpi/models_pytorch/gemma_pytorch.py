@@ -111,6 +111,11 @@ class PaliGemmaWithExpertModel(nn.Module):
         hidden = inputs_embeds
         if model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             hidden = hidden.to(torch.bfloat16)
+        # OpenPI supplies a float32 additive mask even for BF16 queries.
+        # Match SDPA's attention-bias dtype contract; boolean masks stay boolean.
+        # Keep eager masks unchanged to preserve the original pi0 prefill path.
+        if model.config._attn_implementation == "sdpa" and causal_mask is not None and causal_mask.is_floating_point():
+            causal_mask = causal_mask.to(device=hidden.device, dtype=hidden.dtype)
         position_embeddings = model.rotary_emb(hidden, position_ids)
         for layer_index, layer in enumerate(model.layers[:model.config.num_hidden_layers]):
             hidden = apply_mid_vlm_intervention(

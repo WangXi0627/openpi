@@ -695,12 +695,20 @@ class PI0Pytorch(nn.Module):
                 if bool((weights.sum(dim=1) == 0).any()):
                     raise ValueError("No valid image tokens")
                 captured[site] = ((hidden.float() * weights).sum(dim=1) / weights.sum(dim=1)).detach()
-        self.paligemma_with_expert.forward(
-            inputs_embeds=[prefix, None],
-            attention_mask=self._prepare_attention_masks_4d(make_att_2d_masks(pads, att)),
-            position_ids=torch.cumsum(pads, dim=1) - 1, use_cache=False,
-            intervention_context={"image_token_mask": image_mask}, feature_observer=observe,
-        )
+        # Use the same attention implementation as sample_actions prefill.
+        # Restore it afterwards so offline extraction has no lasting side effect.
+        config = self.paligemma_with_expert.paligemma.language_model.config
+        previous_attention = config._attn_implementation
+        try:
+            config._attn_implementation = "eager"
+            self.paligemma_with_expert.forward(
+                inputs_embeds=[prefix, None],
+                attention_mask=self._prepare_attention_masks_4d(make_att_2d_masks(pads, att)),
+                position_ids=torch.cumsum(pads, dim=1) - 1, use_cache=False,
+                intervention_context={"image_token_mask": image_mask}, feature_observer=observe,
+            )
+        finally:
+            config._attn_implementation = previous_attention
         if set(captured) != set(sites):
             raise RuntimeError("Requested site was not reached by the loaded VLM")
         return captured
