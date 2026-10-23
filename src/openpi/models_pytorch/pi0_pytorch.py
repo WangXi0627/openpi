@@ -136,6 +136,22 @@ class PI0Pytorch(nn.Module):
             raise TypeError("feature intervention must be an nn.Module or None")
         self.feature_intervention = intervention
 
+    @staticmethod
+    def _intervention_context(image_token_mask, task_code=None, extra=None):
+        """Build one request-local hook context without mutating the intervention."""
+        context = dict(extra or {})
+        if "image_token_mask" in context:
+            raise ValueError("intervention_context cannot override image_token_mask")
+        if task_code is not None:
+            existing = context.get("task_code")
+            if existing is not None and existing is not task_code:
+                raise ValueError("Conflicting task_code values")
+            context["task_code"] = task_code
+        else:
+            context.setdefault("task_code", None)
+        context["image_token_mask"] = image_token_mask
+        return context
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
@@ -381,6 +397,7 @@ class PI0Pytorch(nn.Module):
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
         intervention_task_code=None,
+        intervention_context=None,
         intervention_enabled: bool = True,
     ):
         """Return predicted and target FM velocities using shared noise/time."""
@@ -438,7 +455,9 @@ class PI0Pytorch(nn.Module):
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
                 feature_intervention=self.feature_intervention if intervention_enabled else None,
-                intervention_context={"image_token_mask": image_token_mask, "task_code": intervention_task_code},
+                intervention_context=self._intervention_context(
+                    image_token_mask, intervention_task_code, intervention_context
+                ),
             )
             return suffix_out
 
@@ -476,6 +495,7 @@ class PI0Pytorch(nn.Module):
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
         intervention_task_code=None,
+        intervention_context=None,
         intervention_enabled: bool = True,
     ) -> Tensor:
         """Return unreduced FM loss with the original OpenPI behavior."""
@@ -491,6 +511,7 @@ class PI0Pytorch(nn.Module):
             adapter_mask_hard=adapter_mask_hard,
             adapter_enabled=adapter_enabled,
             intervention_task_code=intervention_task_code,
+            intervention_context=intervention_context,
             intervention_enabled=intervention_enabled,
         )
         return F.mse_loss(u_t, v_t, reduction="none")
@@ -510,6 +531,7 @@ class PI0Pytorch(nn.Module):
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
         intervention_task_code=None,
+        intervention_context=None,
         intervention_enabled: bool = True,
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -545,7 +567,9 @@ class PI0Pytorch(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             feature_intervention=self.feature_intervention if intervention_enabled else None,
-            intervention_context={"image_token_mask": image_token_mask, "task_code": intervention_task_code},
+            intervention_context=self._intervention_context(
+                    image_token_mask, intervention_task_code, intervention_context
+                ),
             use_cache=True,
         )
 
@@ -584,6 +608,7 @@ class PI0Pytorch(nn.Module):
         adapter_mask_hard: bool = False,
         adapter_enabled: bool = True,
         intervention_task_code=None,
+        intervention_context=None,
         intervention_enabled: bool = True,
     ) -> dict[str, Tensor]:
         """Sample actions and expose noise-dependent and state-only features.
@@ -646,7 +671,9 @@ class PI0Pytorch(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             feature_intervention=self.feature_intervention if intervention_enabled else None,
-            intervention_context={"image_token_mask": image_token_mask, "task_code": intervention_task_code},
+            intervention_context=self._intervention_context(
+                    image_token_mask, intervention_task_code, intervention_context
+                ),
             use_cache=True,
         )
         context_mask = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
