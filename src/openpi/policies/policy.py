@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import logging
 import pathlib
 import time
@@ -172,10 +172,13 @@ class Policy(BasePolicy):
         sample_kwargs = dict(self._sample_kwargs)
         meta_details = None
         if self._meta_subspace_provider is not None:
-            task_code, meta_details = self._meta_subspace_provider(
+            intervention, meta_details = self._meta_subspace_provider(
                 base_task_id=adapter_base_task_id, category=meta_category, variant_id=meta_variant,
             )
-            sample_kwargs["intervention_task_code"] = task_code
+            if isinstance(intervention, Mapping):
+                sample_kwargs["intervention_context"] = dict(intervention)
+            else:
+                sample_kwargs["intervention_task_code"] = intervention
         if self._adapter_mask_bank:
             if adapter_base_task_id is None:
                 raise ValueError(
